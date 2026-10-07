@@ -117,6 +117,8 @@ export default function AdminDashboard() {
     customOrders,
     notifications,
     settings,
+    isSupabaseLive,
+    isLoadingData,
 
     addProduct,
     updateProduct,
@@ -1000,6 +1002,14 @@ export default function AdminDashboard() {
         </div>
 
         <div className="flex items-center gap-2">
+          {/* Supabase Realtime Sync Status Indicator */}
+          <div className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 text-xs font-semibold">
+            <span className={`w-2 h-2 rounded-full ${isSupabaseLive ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`} />
+            <span className="text-zinc-700 dark:text-zinc-300">
+              {isSupabaseLive ? 'Supabase Realtime Live' : 'Supabase Setup Mode'}
+            </span>
+          </div>
+
           {/* Lock Portal button */}
           <button
             onClick={handleAdminLogout}

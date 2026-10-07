@@ -207,9 +207,15 @@ export default function CartDrawer({ onOpenTrackOrderModal }: CartDrawerProps) {
   };
 
   // Final Order Confirmation
-  const handleConfirmOrder = () => {
+  const handleConfirmOrder = async () => {
     setIsPlacingOrder(true);
     setValidationError(null);
+
+    if (!settings.storeOpen) {
+      setValidationError(settings.storeClosedMessage || 'The store is currently closed for new orders.');
+      setIsPlacingOrder(false);
+      return;
+    }
 
     // Re-verify stock before final creation
     for (const item of cart) {
@@ -224,75 +230,73 @@ export default function CartDrawer({ onOpenTrackOrderModal }: CartDrawerProps) {
       }
     }
 
-    setTimeout(() => {
-      const generatedId = generateSecureOrderId();
-      const activeWhatsapp = whatsappSameAsPhone ? phoneNumber : (whatsappNumber || phoneNumber);
+    const generatedId = generateSecureOrderId();
+    const activeWhatsapp = whatsappSameAsPhone ? phoneNumber : (whatsappNumber || phoneNumber);
 
-      const finalAddress =
-        deliveryMethod === 'delivery'
-          ? `${governorate}, ${city}, ${detailedAddress}${buildingDetails ? ` (${buildingDetails})` : ''}`
-          : `Campus Pickup: ${pickupPoint}`;
+    const finalAddress =
+      deliveryMethod === 'delivery'
+        ? `${governorate}, ${city}, ${detailedAddress}${buildingDetails ? ` (${buildingDetails})` : ''}`
+        : `Campus Pickup: ${pickupPoint}`;
 
-      const finalPayment =
-        deliveryMethod === 'delivery'
-          ? isRtl ? 'الدفع نقداً عند الاستلام' : 'Cash on Delivery'
-          : isRtl ? 'الدفع نقداً عند استلام الشحنة بالجامعة' : 'Cash on Pickup';
+    const finalPayment =
+      deliveryMethod === 'delivery'
+        ? isRtl ? 'الدفع نقداً عند الاستلام' : 'Cash on Delivery'
+        : isRtl ? 'الدفع نقداً عند استلام الشحنة بالجامعة' : 'Cash on Pickup';
 
-      const newOrder: Order = {
-        id: generatedId,
-        date: new Date().toISOString().replace('T', ' ').slice(0, 16),
-        orderType: cart.some((i) => i.type === 'kit')
-          ? 'Kit Order'
-          : cart.some((i) => i.type === 'digital')
-          ? 'Digital Product Order'
-          : 'Product Order',
-        status: 'Pending',
-        paymentStatus: 'Unpaid',
-        items: [...cart],
-        subtotal,
-        shipping: deliveryMethod === 'pickup' ? 0 : shipping,
-        discount,
-        total: deliveryMethod === 'pickup' ? subtotal - discount : total,
-        deliveryMethod,
-        campusDeliveryPoint: deliveryMethod === 'pickup' ? pickupPoint : city,
-        deliveryAddress: finalAddress,
-        governorate: deliveryMethod === 'delivery' ? governorate : undefined,
-        city: deliveryMethod === 'delivery' ? city : undefined,
-        detailedAddress: deliveryMethod === 'delivery' ? detailedAddress : undefined,
-        buildingDetails: deliveryMethod === 'delivery' ? buildingDetails : undefined,
-        studentName: fullName.trim(),
-        customerName: fullName.trim(),
-        phone: phoneNumber.trim(),
-        whatsapp: activeWhatsapp.trim(),
-        email: emailAddress.trim() || undefined,
-        preferredContactMethod: preferredContact,
-        customerNotes: customerNotes.trim() || undefined,
-        collegeId: cart[0]?.collegeId || 'engineering',
-        paymentMethod: finalPayment,
-        timeline: [
-          {
-            status: 'Pending',
-            date: new Date().toISOString().replace('T', ' ').slice(0, 16),
-            description: 'Order created by guest customer and placed into pending queue',
-          },
-        ],
-        internalNotes: [],
-      };
+    const newOrder: Order = {
+      id: generatedId,
+      date: new Date().toISOString().replace('T', ' ').slice(0, 16),
+      orderType: cart.some((i) => i.type === 'kit')
+        ? 'Kit Order'
+        : cart.some((i) => i.type === 'digital')
+        ? 'Digital Product Order'
+        : 'Product Order',
+      status: 'Pending',
+      paymentStatus: 'Unpaid',
+      items: [...cart],
+      subtotal,
+      shipping: deliveryMethod === 'pickup' ? 0 : shipping,
+      discount,
+      total: deliveryMethod === 'pickup' ? subtotal - discount : total,
+      deliveryMethod,
+      campusDeliveryPoint: deliveryMethod === 'pickup' ? pickupPoint : city,
+      deliveryAddress: finalAddress,
+      governorate: deliveryMethod === 'delivery' ? governorate : undefined,
+      city: deliveryMethod === 'delivery' ? city : undefined,
+      detailedAddress: deliveryMethod === 'delivery' ? detailedAddress : undefined,
+      buildingDetails: deliveryMethod === 'delivery' ? buildingDetails : undefined,
+      studentName: fullName.trim(),
+      customerName: fullName.trim(),
+      phone: phoneNumber.trim(),
+      whatsapp: activeWhatsapp.trim(),
+      email: emailAddress.trim() || undefined,
+      preferredContactMethod: preferredContact,
+      customerNotes: customerNotes.trim() || undefined,
+      collegeId: cart[0]?.collegeId || 'engineering',
+      paymentMethod: finalPayment,
+      timeline: [
+        {
+          status: 'Pending',
+          date: new Date().toISOString().replace('T', ' ').slice(0, 16),
+          description: 'Order created by guest customer and placed into pending queue',
+        },
+      ],
+      internalNotes: [],
+    };
 
-      addOrder(newOrder);
+    await addOrder(newOrder);
 
-      // Save order for this guest session
-      try {
-        sessionStorage.setItem('sh_last_guest_order', JSON.stringify(newOrder));
-      } catch {
-        // Ignore quota
-      }
+    // Save order for this guest session
+    try {
+      sessionStorage.setItem('sh_last_guest_order', JSON.stringify(newOrder));
+    } catch {
+      // Ignore quota
+    }
 
-      setIsPlacingOrder(false);
-      setSubmittedOrder(newOrder);
-      setCheckoutStep('confirmation');
-      clearCart();
-    }, 800);
+    setIsPlacingOrder(false);
+    setSubmittedOrder(newOrder);
+    setCheckoutStep('confirmation');
+    clearCart();
   };
 
   const handleCopyOrderId = () => {
