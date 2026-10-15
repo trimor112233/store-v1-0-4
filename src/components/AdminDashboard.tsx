@@ -119,6 +119,10 @@ export default function AdminDashboard() {
     settings,
     isSupabaseLive,
     isLoadingData,
+    currentUser,
+    isAdminUser,
+    loginAdmin,
+    logoutAdmin,
 
     addProduct,
     updateProduct,
@@ -873,6 +877,22 @@ export default function AdminDashboard() {
             >
               Verify & Enter Portal / تأكيد الدخول
             </button>
+
+            <div className="pt-2 border-t border-zinc-100 dark:border-zinc-800 space-y-2">
+              <button
+                type="button"
+                onClick={loginAdmin}
+                className="w-full py-3 rounded-xl bg-blue-600 text-white font-bold hover:bg-blue-700 shadow-sm flex items-center justify-center gap-2 transition-colors text-xs"
+              >
+                <span>🌐</span>
+                <span>Sign in with Google (Admin: trimorgain@gmail.com)</span>
+              </button>
+              {currentUser && (
+                <p className="text-[11px] text-center text-zinc-600 dark:text-zinc-400">
+                  Signed in as: <strong className="text-blue-600">{currentUser.email}</strong> {isAdminUser ? '👑 (Admin Authorized)' : '⚠️ (Not Admin)'}
+                </p>
+              )}
+            </div>
           </form>
 
           {/* Safe help card showing default key */}
@@ -1009,6 +1029,20 @@ export default function AdminDashboard() {
               {isSupabaseLive ? 'Supabase Realtime Live' : 'Supabase Setup Mode'}
             </span>
           </div>
+
+          {currentUser ? (
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 text-xs text-blue-700 dark:text-blue-300 font-semibold">
+              <span>👤 {currentUser.email}</span>
+              <button onClick={logoutAdmin} className="text-rose-500 font-bold hover:underline ml-1">Sign Out</button>
+            </div>
+          ) : (
+            <button
+              onClick={loginAdmin}
+              className="px-3 py-2 rounded-xl bg-blue-600 text-white text-xs font-bold hover:bg-blue-700 shadow-sm"
+            >
+              Sign in with Google (Admin)
+            </button>
+          )}
 
           {/* Lock Portal button */}
           <button

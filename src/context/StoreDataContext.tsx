@@ -48,6 +48,9 @@ import {
   initialNotifications,
   initialStoreSettings,
 } from '../data/mockData';
+import { db, auth, loginWithGoogle, logoutUser, isUserAdmin } from '../lib/firebase';
+import { collection, doc, setDoc, deleteDoc, updateDoc, onSnapshot } from 'firebase/firestore';
+import { onAuthStateChanged } from 'firebase/auth';
 import {
   supabase,
   isSupabaseConfigured,
@@ -85,6 +88,12 @@ interface StoreDataContextType {
   inventoryLogs: InventoryLogItem[];
   isSupabaseLive: boolean;
   isLoadingData: boolean;
+
+  // Admin & Firebase Auth
+  currentUser: any;
+  isAdminUser: boolean;
+  loginAdmin: () => Promise<void>;
+  logoutAdmin: () => Promise<void>;
 
   // Supabase Cloud Sync & Configuration
   supabaseConfig: { url: string; key: string; isConfigured: boolean; isEnvConfigured: boolean };
@@ -338,6 +347,102 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         }
       }
     }).catch(() => {});
+  }, []);
+
+  const [currentUser, setCurrentUser] = useState<any>(null);
+  const [isAdminUser, setIsAdminUser] = useState<boolean>(false);
+
+  useEffect(() => {
+    const unsubAuth = onAuthStateChanged(auth, (user) => {
+      setCurrentUser(user);
+      setIsAdminUser(isUserAdmin(user));
+    });
+    return () => unsubAuth();
+  }, []);
+
+  const loginAdmin = useCallback(async () => {
+    try {
+      const user = await loginWithGoogle();
+      setCurrentUser(user);
+      setIsAdminUser(isUserAdmin(user));
+      if (!isUserAdmin(user)) {
+        alert(`Logged in as ${user.email}. Note: Only trimorgain@gmail.com has admin privileges to add or delete products.`);
+      } else {
+        alert('Successfully logged in as Admin (trimorgain@gmail.com)!');
+      }
+    } catch (err: any) {
+      console.error('Login failed:', err);
+      alert('Admin login failed: ' + err.message);
+    }
+  }, []);
+
+  const logoutAdmin = useCallback(async () => {
+    await logoutUser();
+    setCurrentUser(null);
+    setIsAdminUser(false);
+    alert('Logged out successfully.');
+  }, []);
+
+  // Firestore real-time sync across devices
+  useEffect(() => {
+    if (!db) return;
+    try {
+      const unsubProducts = onSnapshot(collection(db, 'products'), (snapshot) => {
+        if (!snapshot.empty) {
+          const prods = snapshot.docs.map(doc => doc.data() as Product);
+          setProducts(prods);
+        } else {
+          productsData.forEach(p => {
+            setDoc(doc(db, 'products', p.id), p).catch(() => {});
+          });
+        }
+      }, () => {});
+
+      const unsubCategories = onSnapshot(collection(db, 'categories'), (snapshot) => {
+        if (!snapshot.empty) {
+          const cats = snapshot.docs.map(doc => doc.data() as Category);
+          setCategories(cats);
+        } else {
+          categoriesData.forEach(c => {
+            setDoc(doc(db, 'categories', c.id), c).catch(() => {});
+          });
+        }
+      }, () => {});
+
+      const unsubOrders = onSnapshot(collection(db, 'orders'), (snapshot) => {
+        if (!snapshot.empty) {
+          const ords = snapshot.docs.map(doc => doc.data() as Order);
+          setOrders(ords);
+        }
+      }, () => {});
+
+      const unsubCoupons = onSnapshot(collection(db, 'coupons'), (snapshot) => {
+        if (!snapshot.empty) {
+          const coups = snapshot.docs.map(doc => doc.data() as Coupon);
+          setCoupons(coups);
+        }
+      }, () => {});
+
+      const unsubBanners = onSnapshot(collection(db, 'banners'), (snapshot) => {
+        if (!snapshot.empty) {
+          const bans = snapshot.docs.map(doc => doc.data() as HomepageBanner);
+          setBanners(bans);
+        }
+      }, () => {});
+
+      setIsLoadingData(false);
+
+      return () => {
+        unsubProducts();
+        unsubCategories();
+        unsubOrders();
+        unsubCoupons();
+        unsubBanners();
+      };
+    } catch (e) {
+      console.warn('Firestore subscription error:', e);
+      setIsLoadingData(false);
+    }
   }, []);
 
   const [isSupabaseLive, setIsSupabaseLive] = useState<boolean>(isSupabaseConfigured());
@@ -707,8 +812,13 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     }
   }, []);
 
-  // ===================== PRODUCT HANDLERS =====================
   const addProduct = useCallback(async (productData: Omit<Product, 'id'>): Promise<Product> => {
+    const user = auth.currentUser;
+    if (!user || user.email?.toLowerCase() !== 'trimorgain@gmail.com') {
+      alert('Access Denied: Only store owner (trimorgain@gmail.com) can add products. Please sign in with Google admin account.');
+      throw new Error('Unauthorized: Admin access required.');
+    }
+
     const id = `prod-${Date.now()}`;
     const newProduct: Product = { ...productData, id };
     
@@ -722,14 +832,10 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return updated;
     });
 
-    if (supabase && isSupabaseConfigured()) {
-      try {
-        const dbRow = mapProductToDb(newProduct);
-        const { error } = await supabase.from('products').insert(dbRow);
-        if (error) console.warn('[Supabase] Add product cloud sync:', error.message);
-      } catch (err) {
-        console.warn('[Supabase] Network error during product insert:', err);
-      }
+    try {
+      await setDoc(doc(db, 'products', id), newProduct);
+    } catch (err) {
+      console.warn('Firestore add product error:', err);
     }
 
     return newProduct;
@@ -743,13 +849,10 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       if (target) saveAddedItem('products', target);
       return updated;
     });
-    if (supabase && isSupabaseConfigured()) {
-      try {
-        const dbRow = mapProductToDb(updates);
-        await supabase.from('products').update(dbRow).eq('id', id);
-      } catch (err) {
-        console.warn('[Supabase] Network error updating product:', err);
-      }
+    try {
+      await updateDoc(doc(db, 'products', id), updates as any);
+    } catch (err) {
+      console.warn('Firestore update product error:', err);
     }
   }, []);
 
@@ -765,23 +868,27 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return updated;
     });
 
-    if (supabase && isSupabaseConfigured()) {
-      try {
-        const target = products.find((p) => p.id === id);
-        const inStock = status !== 'out_of_stock';
-        const stock = status === 'out_of_stock' ? 0 : status === 'low_stock' && target && target.stock > 10 ? 5 : target?.stock || 0;
-        await supabase.from('products').update({
-          stock_status: status,
-          in_stock: inStock,
-          stock,
-        }).eq('id', id);
-      } catch (err) {
-        console.warn('[Supabase] Network error updating product stock:', err);
-      }
+    try {
+      const target = products.find((p) => p.id === id);
+      const inStock = status !== 'out_of_stock';
+      const stock = status === 'out_of_stock' ? 0 : status === 'low_stock' && target && target.stock > 10 ? 5 : target?.stock || 0;
+      await updateDoc(doc(db, 'products', id), {
+        stockStatus: status,
+        inStock,
+        stock,
+      });
+    } catch (err) {
+      console.warn('Firestore update product stock error:', err);
     }
   }, [products]);
 
   const deleteProduct = useCallback(async (id: string) => {
+    const user = auth.currentUser;
+    if (!user || user.email?.toLowerCase() !== 'trimorgain@gmail.com') {
+      alert('Access Denied: Only store owner (trimorgain@gmail.com) can delete products. Please sign in with Google admin account.');
+      throw new Error('Unauthorized: Admin access required.');
+    }
+
     // Record in deleted tracking so refresh never brings it back
     addDeletedId('products', id);
     removeAddedItem('products', id);
@@ -792,13 +899,10 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       return updated;
     });
 
-    if (supabase && isSupabaseConfigured()) {
-      try {
-        const { error } = await supabase.from('products').delete().eq('id', id);
-        if (error) console.warn('[Supabase] Delete product cloud sync:', error.message);
-      } catch (err) {
-        console.warn('[Supabase] Network error deleting product:', err);
-      }
+    try {
+      await deleteDoc(doc(db, 'products', id));
+    } catch (err) {
+      console.warn('Firestore delete product error:', err);
     }
   }, []);
 
@@ -1864,6 +1968,10 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         inventoryLogs,
         isSupabaseLive,
         isLoadingData,
+        currentUser,
+        isAdminUser,
+        loginAdmin,
+        logoutAdmin,
 
         // Supabase Cloud Sync
         supabaseConfig,
