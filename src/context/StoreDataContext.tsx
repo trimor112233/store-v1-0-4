@@ -48,14 +48,20 @@ import {
   initialNotifications,
   initialStoreSettings,
 } from '../data/mockData';
-import { supabase, isSupabaseConfigured } from '../lib/supabase';
+import {
+  supabase,
+  isSupabaseConfigured,
+  getSupabaseConfig,
+  saveSupabaseConfig,
+  clearSupabaseConfig,
+} from '../lib/supabase';
 import {
   fetchAllStoreData,
   createOrderInSupabase,
   seedInitialDataToSupabase,
+  syncAllLocalDataToSupabase,
+  testSupabaseConnection,
   mapProductToDb,
-  mapProductFromDb,
-  mapOrderFromDb,
 } from '../services/supabaseStoreService';
 
 interface StoreDataContextType {
@@ -79,6 +85,13 @@ interface StoreDataContextType {
   inventoryLogs: InventoryLogItem[];
   isSupabaseLive: boolean;
   isLoadingData: boolean;
+
+  // Supabase Cloud Sync & Configuration
+  supabaseConfig: { url: string; key: string; isConfigured: boolean; isEnvConfigured: boolean };
+  saveSupabaseCredentials: (url: string, key: string) => Promise<{ success: boolean; message: string }>;
+  disconnectSupabaseCredentials: () => void;
+  syncLocalToCloud: () => Promise<{ success: boolean; message: string }>;
+  testCloudConnection: () => Promise<{ success: boolean; message: string }>;
 
   // Product Actions
   addProduct: (product: Omit<Product, 'id'>) => Promise<Product>;
@@ -115,6 +128,7 @@ interface StoreDataContextType {
   addOrderInternalNote: (orderId: string, text: string, author?: string) => Promise<void>;
   updateOrderDetails: (orderId: string, updates: Partial<Order>) => Promise<void>;
   cancelOrder: (orderId: string, reason?: string) => Promise<void>;
+  deleteOrder: (orderId: string) => Promise<void>;
 
   // Coupon Actions
   addCoupon: (coupon: Omit<Coupon, 'id'>) => Promise<void>;
@@ -183,59 +197,319 @@ interface StoreDataContextType {
 
 const StoreDataContext = createContext<StoreDataContextType | undefined>(undefined);
 
+import {
+  loadFromStorage,
+  saveToStorage,
+  isKeyInitialized,
+  getDeletedIds,
+  addDeletedId,
+  unmarkDeletedId,
+  getAddedMap,
+  saveAddedItem,
+  removeAddedItem,
+  idbGet,
+} from '../lib/storage';
+
+export { getDeletedIds, addDeletedId, unmarkDeletedId, getAddedMap, saveAddedItem, removeAddedItem };
+
 export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [products, setProducts] = useState<Product[]>(productsData);
-  const [categories, setCategories] = useState<Category[]>(categoriesData);
-  const [subcategories, setSubcategories] = useState<Subcategory[]>(subcategoriesData);
-  const [departments] = useState<Department[]>(departmentsData);
-  const [colleges, setColleges] = useState<College[]>(collegesData);
-  const [kits, setKits] = useState<StudentKit[]>(studentKitsData);
-  const [digitalProducts, setDigitalProducts] = useState<DigitalProduct[]>(digitalProductsData);
-  const [orders, setOrders] = useState<Order[]>(initialOrders);
-  const [customers, setCustomers] = useState<Customer[]>(initialCustomers);
-  const [reviews, setReviews] = useState<Review[]>(initialReviews);
-  const [coupons, setCoupons] = useState<Coupon[]>(initialCoupons);
-  const [banners, setBanners] = useState<HomepageBanner[]>(initialBanners);
-  const [homepageSettings, setHomepageSettings] = useState<HomepageSettings>(initialHomepageSettings);
-  const [printingRequests, setPrintingRequests] = useState<PrintingRequest[]>(initialPrintingRequests);
-  const [customOrders, setCustomOrders] = useState<CustomOrder[]>(initialCustomOrders);
-  const [notifications, setNotifications] = useState<AdminNotification[]>(initialNotifications);
-  const [settings, setSettings] = useState<StoreSettings>(initialStoreSettings);
-  const [inventoryLogs, setInventoryLogs] = useState<InventoryLogItem[]>([]);
+  // Initialize state with cached local storage + reconcile with mutation tracking so changes NEVER revert on refresh
+  const [products, setProducts] = useState<Product[]>(() => {
+    const loaded = loadFromStorage<Product[]>('products', null as any);
+    const deletedIds = getDeletedIds('products');
+    const addedMap = getAddedMap<Product>('products');
+
+    let base: Product[] = Array.isArray(loaded) ? loaded : productsData;
+    // Always filter out items explicitly deleted by the user
+    base = base.filter((p) => !deletedIds.has(p.id));
+    // Always ensure items added by user are present
+    Object.values(addedMap).forEach((localProd) => {
+      if (!base.some((p) => p.id === localProd.id) && !deletedIds.has(localProd.id)) {
+        base = [localProd, ...base];
+      }
+    });
+    return base;
+  });
+
+  const [categories, setCategories] = useState<Category[]>(() => {
+    const loaded = loadFromStorage<Category[]>('categories', null as any);
+    const deletedIds = getDeletedIds('categories');
+    const addedMap = getAddedMap<Category>('categories');
+
+    let base: Category[] = Array.isArray(loaded) ? loaded : categoriesData;
+    base = base.filter((c) => !deletedIds.has(c.id));
+    Object.values(addedMap).forEach((localCat) => {
+      if (!base.some((c) => c.id === localCat.id) && !deletedIds.has(localCat.id)) {
+        base = [...base, localCat];
+      }
+    });
+    return base;
+  });
+
+  const [subcategories, setSubcategories] = useState<Subcategory[]>(() => {
+    const loaded = loadFromStorage<Subcategory[]>('subcategories', null as any);
+    const deletedIds = getDeletedIds('subcategories');
+    const addedMap = getAddedMap<Subcategory>('subcategories');
+
+    let base: Subcategory[] = Array.isArray(loaded) ? loaded : subcategoriesData;
+    base = base.filter((s) => !deletedIds.has(s.id));
+    Object.values(addedMap).forEach((localSub) => {
+      if (!base.some((s) => s.id === localSub.id) && !deletedIds.has(localSub.id)) {
+        base = [...base, localSub];
+      }
+    });
+    return base;
+  });
+  const [departments] = useState<Department[]>(() => departmentsData);
+  const [colleges, setColleges] = useState<College[]>(() => {
+    const loaded = loadFromStorage<College[]>('colleges', null as any);
+    const deletedIds = getDeletedIds('colleges');
+    let base: College[] = Array.isArray(loaded) ? loaded : (isKeyInitialized('colleges') ? [] : collegesData);
+    return base.filter((c) => !deletedIds.has(c.id));
+  });
+  const [kits, setKits] = useState<StudentKit[]>(() => {
+    const loaded = loadFromStorage<StudentKit[]>('kits', null as any);
+    const deletedIds = getDeletedIds('kits');
+    let base: StudentKit[] = Array.isArray(loaded) ? loaded : (isKeyInitialized('kits') ? [] : studentKitsData);
+    return base.filter((k) => !deletedIds.has(k.id));
+  });
+  const [digitalProducts, setDigitalProducts] = useState<DigitalProduct[]>(() => {
+    const loaded = loadFromStorage<DigitalProduct[]>('digital_products', null as any);
+    const deletedIds = getDeletedIds('digital_products');
+    let base: DigitalProduct[] = Array.isArray(loaded) ? loaded : (isKeyInitialized('digital_products') ? [] : digitalProductsData);
+    return base.filter((d) => !deletedIds.has(d.id));
+  });
+  const [orders, setOrders] = useState<Order[]>(() => {
+    const loaded = loadFromStorage<Order[]>('orders', null as any);
+    const deletedIds = getDeletedIds('orders');
+    let base: Order[] = Array.isArray(loaded) ? loaded : (isKeyInitialized('orders') ? [] : initialOrders);
+    return base.filter((o) => !deletedIds.has(o.id));
+  });
+  const [customers, setCustomers] = useState<Customer[]>(() => loadFromStorage<Customer[]>('customers', initialCustomers));
+  const [reviews, setReviews] = useState<Review[]>(() => {
+    const loaded = loadFromStorage<Review[]>('reviews', null as any);
+    const deletedIds = getDeletedIds('reviews');
+    let base: Review[] = Array.isArray(loaded) ? loaded : (isKeyInitialized('reviews') ? [] : initialReviews);
+    return base.filter((r) => !deletedIds.has(r.id));
+  });
+  const [coupons, setCoupons] = useState<Coupon[]>(() => {
+    const loaded = loadFromStorage<Coupon[]>('coupons', null as any);
+    const deletedIds = getDeletedIds('coupons');
+    let base: Coupon[] = Array.isArray(loaded) ? loaded : (isKeyInitialized('coupons') ? [] : initialCoupons);
+    return base.filter((c) => !deletedIds.has(c.id));
+  });
+  const [banners, setBanners] = useState<HomepageBanner[]>(() => {
+    const loaded = loadFromStorage<HomepageBanner[]>('banners', null as any);
+    const deletedIds = getDeletedIds('banners');
+    let base: HomepageBanner[] = Array.isArray(loaded) ? loaded : (isKeyInitialized('banners') ? [] : initialBanners);
+    return base.filter((b) => !deletedIds.has(b.id));
+  });
+  const [homepageSettings, setHomepageSettings] = useState<HomepageSettings>(() => loadFromStorage('homepage_settings', initialHomepageSettings));
+  const [printingRequests, setPrintingRequests] = useState<PrintingRequest[]>(() => loadFromStorage<PrintingRequest[]>('printing', initialPrintingRequests));
+  const [customOrders, setCustomOrders] = useState<CustomOrder[]>(() => loadFromStorage<CustomOrder[]>('custom_orders', initialCustomOrders));
+  const [notifications, setNotifications] = useState<AdminNotification[]>(() => {
+    const loaded = loadFromStorage<AdminNotification[]>('notifications', []);
+    return loaded && loaded.length > 0 ? loaded : initialNotifications;
+  });
+  const [settings, setSettings] = useState<StoreSettings>(() => {
+    const loaded = loadFromStorage<Partial<StoreSettings>>('settings', initialStoreSettings);
+    return {
+      ...initialStoreSettings,
+      ...loaded,
+      navigationLinks: loaded.navigationLinks && loaded.navigationLinks.length > 0 ? loaded.navigationLinks : initialStoreSettings.navigationLinks,
+      pickupLocations: loaded.pickupLocations && loaded.pickupLocations.length > 0 ? loaded.pickupLocations : initialStoreSettings.pickupLocations,
+      paymentMethods: loaded.paymentMethods && loaded.paymentMethods.length > 0 ? loaded.paymentMethods : initialStoreSettings.paymentMethods,
+      deliverySettings: { ...initialStoreSettings.deliverySettings, ...(loaded.deliverySettings || {}) },
+      websiteContent: { ...initialStoreSettings.websiteContent, ...(loaded.websiteContent || {}) },
+      socialLinks: { ...initialStoreSettings.socialLinks, ...(loaded.socialLinks || {}) },
+      customDesignTemplates: loaded.customDesignTemplates && loaded.customDesignTemplates.length > 0 ? loaded.customDesignTemplates : initialStoreSettings.customDesignTemplates,
+    };
+  });
+  const [inventoryLogs, setInventoryLogs] = useState<InventoryLogItem[]>(() => loadFromStorage<InventoryLogItem[]>('inventory_logs', []));
+
+  // Asynchronous hydration from IndexedDB for rich persistent state
+  useEffect(() => {
+    idbGet<Product[]>('products').then((idbProds) => {
+      if (idbProds && Array.isArray(idbProds) && idbProds.length > 0) {
+        const deletedIds = getDeletedIds('products');
+        const filtered = idbProds.filter((p) => !deletedIds.has(p.id));
+        if (filtered.length > 0) {
+          setProducts(filtered);
+        }
+      }
+    }).catch(() => {});
+  }, []);
 
   const [isSupabaseLive, setIsSupabaseLive] = useState<boolean>(isSupabaseConfigured());
   const [isLoadingData, setIsLoadingData] = useState<boolean>(true);
 
-  // Load store data from Supabase
+  // Auto-sync state changes to persistent local cache
+  useEffect(() => saveToStorage('products', products), [products]);
+  useEffect(() => saveToStorage('categories', categories), [categories]);
+  useEffect(() => saveToStorage('subcategories', subcategories), [subcategories]);
+  useEffect(() => saveToStorage('kits', kits), [kits]);
+  useEffect(() => saveToStorage('digital_products', digitalProducts), [digitalProducts]);
+  useEffect(() => saveToStorage('orders', orders), [orders]);
+  useEffect(() => saveToStorage('customers', customers), [customers]);
+  useEffect(() => saveToStorage('reviews', reviews), [reviews]);
+  useEffect(() => saveToStorage('coupons', coupons), [coupons]);
+  useEffect(() => saveToStorage('banners', banners), [banners]);
+  useEffect(() => saveToStorage('homepage_settings', homepageSettings), [homepageSettings]);
+  useEffect(() => saveToStorage('printing', printingRequests), [printingRequests]);
+  useEffect(() => saveToStorage('custom_orders', customOrders), [customOrders]);
+  useEffect(() => saveToStorage('colleges', colleges), [colleges]);
+  useEffect(() => saveToStorage('notifications', notifications), [notifications]);
+  useEffect(() => saveToStorage('settings', settings), [settings]);
+  useEffect(() => saveToStorage('inventory_logs', inventoryLogs), [inventoryLogs]);
+
+  // Load store data from Supabase if configured with mutation reconciliation
   const loadData = useCallback(async () => {
     setIsLoadingData(true);
     if (isSupabaseConfigured()) {
       setIsSupabaseLive(true);
-      const data = await fetchAllStoreData();
-      if (data) {
-        if (data.products && data.products.length > 0) setProducts(data.products);
-        if (data.categories && data.categories.length > 0) setCategories(data.categories);
-        if (data.subcategories && data.subcategories.length > 0) setSubcategories(data.subcategories);
-        if (data.colleges && data.colleges.length > 0) setColleges(data.colleges);
-        if (data.kits && data.kits.length > 0) setKits(data.kits);
-        if (data.digitalProducts && data.digitalProducts.length > 0) setDigitalProducts(data.digitalProducts);
-        if (data.orders) setOrders(data.orders);
-        if (data.reviews) setReviews(data.reviews);
-        if (data.coupons && data.coupons.length > 0) setCoupons(data.coupons);
-        if (data.banners && data.banners.length > 0) setBanners(data.banners);
-        if (data.homepageSettings) setHomepageSettings(data.homepageSettings);
-        if (data.printingRequests) setPrintingRequests(data.printingRequests);
-        if (data.customOrders) setCustomOrders(data.customOrders);
-        if (data.notifications) setNotifications(data.notifications);
-        if (data.storeSettings) setSettings(data.storeSettings);
-        if (data.inventoryLogs) setInventoryLogs(data.inventoryLogs);
+      try {
+        const data = await fetchAllStoreData();
+        if (data) {
+          // Reconcile Products
+          if (data.products && Array.isArray(data.products) && data.products.length > 0) {
+            const deletedProdIds = getDeletedIds('products');
+            const addedProdMap = getAddedMap<Product>('products');
 
-        // Seed initial data if Supabase tables are fresh
-        await seedInitialDataToSupabase({
-          products: productsData,
-          categories: categoriesData,
-          settings: initialStoreSettings,
-        });
+            let reconciledProds = data.products.filter((p) => !deletedProdIds.has(p.id));
+            Object.values(addedProdMap).forEach((addedProd) => {
+              if (!reconciledProds.some((p) => p.id === addedProd.id) && !deletedProdIds.has(addedProd.id)) {
+                reconciledProds = [addedProd, ...reconciledProds];
+              }
+            });
+
+            setProducts(reconciledProds);
+            saveToStorage('products', reconciledProds);
+          }
+
+          // Reconcile Categories
+          if (data.categories && Array.isArray(data.categories) && data.categories.length > 0) {
+            const deletedCatIds = getDeletedIds('categories');
+            const addedCatMap = getAddedMap<Category>('categories');
+
+            let reconciledCats = data.categories.filter((c) => !deletedCatIds.has(c.id)) as Category[];
+            Object.values(addedCatMap).forEach((addedCat) => {
+              if (!reconciledCats.some((c) => c.id === addedCat.id) && !deletedCatIds.has(addedCat.id)) {
+                reconciledCats = [...reconciledCats, addedCat];
+              }
+            });
+
+            setCategories(reconciledCats);
+            saveToStorage('categories', reconciledCats);
+          }
+
+          // Reconcile Subcategories
+          if (data.subcategories && Array.isArray(data.subcategories) && data.subcategories.length > 0) {
+            const deletedSubIds = getDeletedIds('subcategories');
+            const addedSubMap = getAddedMap<Subcategory>('subcategories');
+
+            let reconciledSubs = data.subcategories.filter((s) => !deletedSubIds.has(s.id));
+            Object.values(addedSubMap).forEach((addedSub) => {
+              if (!reconciledSubs.some((s) => s.id === addedSub.id) && !deletedSubIds.has(addedSub.id)) {
+                reconciledSubs = [...reconciledSubs, addedSub];
+              }
+            });
+
+            setSubcategories(reconciledSubs);
+            saveToStorage('subcategories', reconciledSubs);
+          }
+
+          if (data.colleges && data.colleges.length > 0) {
+            setColleges(data.colleges);
+            saveToStorage('colleges', data.colleges);
+          }
+          if (data.kits && data.kits.length > 0) {
+            setKits(data.kits);
+            saveToStorage('kits', data.kits);
+          }
+          if (data.digitalProducts && data.digitalProducts.length > 0) {
+            setDigitalProducts(data.digitalProducts);
+            saveToStorage('digital_products', data.digitalProducts);
+          }
+          if (data.orders && Array.isArray(data.orders)) {
+            setOrders(data.orders);
+            saveToStorage('orders', data.orders);
+          }
+          if (data.reviews && Array.isArray(data.reviews)) {
+            const deletedRevIds = getDeletedIds('reviews');
+            const filteredRevs = data.reviews.filter((r) => !deletedRevIds.has(r.id));
+            setReviews(filteredRevs);
+            saveToStorage('reviews', filteredRevs);
+          }
+
+          // Reconcile Coupons
+          if (data.coupons && Array.isArray(data.coupons) && data.coupons.length > 0) {
+            const deletedCoupIds = getDeletedIds('coupons');
+            const addedCoupMap = getAddedMap<Coupon>('coupons');
+
+            let reconciledCoups = data.coupons.filter((c) => !deletedCoupIds.has(c.id)) as Coupon[];
+            Object.values(addedCoupMap).forEach((addedCoup) => {
+              if (!reconciledCoups.some((c) => c.id === addedCoup.id) && !deletedCoupIds.has(addedCoup.id)) {
+                reconciledCoups = [...reconciledCoups, addedCoup];
+              }
+            });
+
+            setCoupons(reconciledCoups);
+            saveToStorage('coupons', reconciledCoups);
+          }
+
+          // Reconcile Banners
+          if (data.banners && Array.isArray(data.banners) && data.banners.length > 0) {
+            const deletedBanIds = getDeletedIds('banners');
+            const addedBanMap = getAddedMap<HomepageBanner>('banners');
+
+            let reconciledBans = data.banners.filter((b) => !deletedBanIds.has(b.id)) as HomepageBanner[];
+            Object.values(addedBanMap).forEach((addedBan) => {
+              if (!reconciledBans.some((b) => b.id === addedBan.id) && !deletedBanIds.has(addedBan.id)) {
+                reconciledBans = [...reconciledBans, addedBan];
+              }
+            });
+
+            setBanners(reconciledBans);
+            saveToStorage('banners', reconciledBans);
+          }
+
+          if (data.homepageSettings) {
+            setHomepageSettings(data.homepageSettings);
+            saveToStorage('homepage_settings', data.homepageSettings);
+          }
+          if (data.printingRequests) {
+            setPrintingRequests(data.printingRequests);
+            saveToStorage('printing', data.printingRequests);
+          }
+          if (data.customOrders) {
+            setCustomOrders(data.customOrders);
+            saveToStorage('custom_orders', data.customOrders);
+          }
+          if (data.notifications) {
+            setNotifications(data.notifications);
+            saveToStorage('notifications', data.notifications);
+          }
+          if (data.storeSettings) {
+            setSettings(data.storeSettings);
+            saveToStorage('settings', data.storeSettings);
+          }
+          if (data.inventoryLogs) {
+            setInventoryLogs(data.inventoryLogs);
+            saveToStorage('inventory_logs', data.inventoryLogs);
+          }
+
+          // Seed initial data ONLY ONCE if never seeded before
+          if (typeof window !== 'undefined' && localStorage.getItem('sh_supabase_seeded') !== 'true') {
+            await seedInitialDataToSupabase({
+              products: productsData,
+              categories: categoriesData,
+              settings: initialStoreSettings,
+            });
+            localStorage.setItem('sh_supabase_seeded', 'true');
+          }
+        }
+      } catch (err) {
+        console.warn('[StoreData] Error syncing with cloud database:', err);
       }
     } else {
       setIsSupabaseLive(false);
@@ -252,43 +526,142 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   useEffect(() => {
     if (!supabase || !isSupabaseConfigured()) return;
 
-    const channel = supabase
-      .channel('store_realtime_sync')
-      .on('postgres_changes', { event: '*', schema: 'public' }, () => {
-        // Refetch latest data when any table changes on any device
-        fetchAllStoreData().then((data) => {
-          if (data) {
-            setProducts(data.products || []);
-            setCategories(data.categories || []);
-            setSubcategories(data.subcategories || []);
-            setColleges(data.colleges || []);
-            setKits(data.kits || []);
-            setDigitalProducts(data.digitalProducts || []);
-            setOrders(data.orders || []);
-            setReviews(data.reviews || []);
-            setCoupons(data.coupons || []);
-            setBanners(data.banners || []);
-            if (data.homepageSettings) setHomepageSettings(data.homepageSettings);
-            setPrintingRequests(data.printingRequests || []);
-            setCustomOrders(data.customOrders || []);
-            setNotifications(data.notifications || []);
-            if (data.storeSettings) setSettings(data.storeSettings);
-            setInventoryLogs(data.inventoryLogs || []);
-          }
-        });
-      })
-      .subscribe();
+    try {
+      const channel = supabase
+        .channel('store_realtime_sync')
+        .on('postgres_changes', { event: '*', schema: 'public' }, () => {
+          // Refetch latest data when any table changes on any device
+          fetchAllStoreData().then((data) => {
+            if (data) {
+              if (data.products !== undefined) {
+                const deletedProdIds = getDeletedIds('products');
+                const addedProdMap = getAddedMap<Product>('products');
+                let reconciledProds = data.products.filter((p) => !deletedProdIds.has(p.id));
+                Object.values(addedProdMap).forEach((addedProd) => {
+                  if (!reconciledProds.some((p) => p.id === addedProd.id) && !deletedProdIds.has(addedProd.id)) {
+                    reconciledProds = [addedProd, ...reconciledProds];
+                  }
+                });
+                setProducts(reconciledProds);
+                saveToStorage('products', reconciledProds);
+              }
+              if (data.categories !== undefined) {
+                const deletedCatIds = getDeletedIds('categories');
+                const addedCatMap = getAddedMap<Category>('categories');
+                let reconciledCats = data.categories.filter((c) => !deletedCatIds.has(c.id)) as Category[];
+                Object.values(addedCatMap).forEach((addedCat) => {
+                  if (!reconciledCats.some((c) => c.id === addedCat.id) && !deletedCatIds.has(addedCat.id)) {
+                    reconciledCats = [...reconciledCats, addedCat];
+                  }
+                });
+                setCategories(reconciledCats);
+                saveToStorage('categories', reconciledCats);
+              }
+              if (data.subcategories !== undefined) {
+                const deletedSubIds = getDeletedIds('subcategories');
+                const addedSubMap = getAddedMap<Subcategory>('subcategories');
+                let reconciledSubs = data.subcategories.filter((s) => !deletedSubIds.has(s.id));
+                Object.values(addedSubMap).forEach((addedSub) => {
+                  if (!reconciledSubs.some((s) => s.id === addedSub.id) && !deletedSubIds.has(addedSub.id)) {
+                    reconciledSubs = [...reconciledSubs, addedSub];
+                  }
+                });
+                setSubcategories(reconciledSubs);
+                saveToStorage('subcategories', reconciledSubs);
+              }
+              if (data.orders !== undefined) {
+                const deletedOrderIds = getDeletedIds('orders');
+                const reconciledOrders = data.orders.filter((o) => !deletedOrderIds.has(o.id));
+                setOrders(reconciledOrders);
+                saveToStorage('orders', reconciledOrders);
+              }
+              if (data.coupons !== undefined) {
+                const deletedCoupIds = getDeletedIds('coupons');
+                const addedCoupMap = getAddedMap<Coupon>('coupons');
+                let reconciledCoups = data.coupons.filter((c) => !deletedCoupIds.has(c.id)) as Coupon[];
+                Object.values(addedCoupMap).forEach((addedCoup) => {
+                  if (!reconciledCoups.some((c) => c.id === addedCoup.id) && !deletedCoupIds.has(addedCoup.id)) {
+                    reconciledCoups = [...reconciledCoups, addedCoup];
+                  }
+                });
+                setCoupons(reconciledCoups);
+                saveToStorage('coupons', reconciledCoups);
+              }
+              if (data.reviews !== undefined) {
+                const deletedRevIds = getDeletedIds('reviews');
+                const reconciledRevs = data.reviews.filter((r) => !deletedRevIds.has(r.id));
+                setReviews(reconciledRevs);
+                saveToStorage('reviews', reconciledRevs);
+              }
+              if (data.storeSettings) {
+                setSettings(data.storeSettings);
+                saveToStorage('settings', data.storeSettings);
+              }
+              if (data.inventoryLogs) {
+                setInventoryLogs(data.inventoryLogs);
+                saveToStorage('inventory_logs', data.inventoryLogs);
+              }
+            }
+          });
+        })
+        .subscribe();
 
-    return () => {
-      if (supabase) {
-        supabase.removeChannel(channel);
-      }
-    };
+      return () => {
+        if (supabase) {
+          supabase.removeChannel(channel);
+        }
+      };
+    } catch (err) {
+      console.warn('Realtime channel subscription skipped:', err);
+    }
+  }, [isSupabaseLive]);
+
+  // ===================== SUPABASE CREDENTIALS & SYNC =====================
+  const supabaseConfig = {
+    ...getSupabaseConfig(),
+    isConfigured: isSupabaseConfigured(),
+  };
+
+  const saveSupabaseCredentials = useCallback(async (url: string, key: string) => {
+    saveSupabaseConfig(url, key);
+    const result = await testSupabaseConnection();
+    if (result.success) {
+      setIsSupabaseLive(true);
+      await loadData();
+    } else {
+      setIsSupabaseLive(false);
+    }
+    return result;
+  }, [loadData]);
+
+  const disconnectSupabaseCredentials = useCallback(() => {
+    clearSupabaseConfig();
+    setIsSupabaseLive(false);
+  }, []);
+
+  const syncLocalToCloud = useCallback(async () => {
+    return await syncAllLocalDataToSupabase({
+      products,
+      categories,
+      subcategories,
+      settings,
+      coupons,
+      banners,
+      orders,
+    });
+  }, [products, categories, subcategories, settings, coupons, banners, orders]);
+
+  const testCloudConnection = useCallback(async () => {
+    return await testSupabaseConnection();
   }, []);
 
   // ===================== COLLEGE HANDLERS =====================
   const addCollege = useCallback(async (col: College) => {
-    setColleges((prev) => [...prev, col]);
+    setColleges((prev) => {
+      const updated = [...prev, col];
+      saveToStorage('colleges', updated);
+      return updated;
+    });
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('colleges').insert({
         id: col.id,
@@ -302,7 +675,11 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, []);
 
   const updateCollege = useCallback(async (id: CollegeId, updates: Partial<College>) => {
-    setColleges((prev) => prev.map((c) => (c.id === id ? { ...c, ...updates } : c)));
+    setColleges((prev) => {
+      const updated = prev.map((c) => (c.id === id ? { ...c, ...updates } : c));
+      saveToStorage('colleges', updated);
+      return updated;
+    });
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('colleges').update({
         ...(updates.name && { name: updates.name }),
@@ -315,9 +692,18 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, []);
 
   const deleteCollege = useCallback(async (id: CollegeId) => {
-    setColleges((prev) => prev.filter((c) => c.id !== id));
+    addDeletedId('colleges', id);
+    setColleges((prev) => {
+      const updated = prev.filter((c) => c.id !== id);
+      saveToStorage('colleges', updated);
+      return updated;
+    });
     if (supabase && isSupabaseConfigured()) {
-      await supabase.from('colleges').delete().eq('id', id);
+      try {
+        await supabase.from('colleges').delete().eq('id', id);
+      } catch (err) {
+        console.warn('[Supabase] Delete college cloud error:', err);
+      }
     }
   }, []);
 
@@ -325,50 +711,94 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const addProduct = useCallback(async (productData: Omit<Product, 'id'>): Promise<Product> => {
     const id = `prod-${Date.now()}`;
     const newProduct: Product = { ...productData, id };
-    setProducts((prev) => [newProduct, ...prev]);
+    
+    // Track locally so refresh never loses the added product
+    saveAddedItem('products', newProduct);
+    unmarkDeletedId('products', id);
+
+    setProducts((prev) => {
+      const updated = [newProduct, ...prev.filter((p) => p.id !== id)];
+      saveToStorage('products', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
-      const dbRow = mapProductToDb(newProduct);
-      await supabase.from('products').insert(dbRow);
+      try {
+        const dbRow = mapProductToDb(newProduct);
+        const { error } = await supabase.from('products').insert(dbRow);
+        if (error) console.warn('[Supabase] Add product cloud sync:', error.message);
+      } catch (err) {
+        console.warn('[Supabase] Network error during product insert:', err);
+      }
     }
 
     return newProduct;
   }, []);
 
   const updateProduct = useCallback(async (id: string, updates: Partial<Product>) => {
-    setProducts((prev) => prev.map((p) => (p.id === id ? { ...p, ...updates } : p)));
+    setProducts((prev) => {
+      const updated = prev.map((p) => (p.id === id ? { ...p, ...updates } : p));
+      saveToStorage('products', updated);
+      const target = updated.find((p) => p.id === id);
+      if (target) saveAddedItem('products', target);
+      return updated;
+    });
     if (supabase && isSupabaseConfigured()) {
-      const dbRow = mapProductToDb(updates);
-      await supabase.from('products').update(dbRow).eq('id', id);
+      try {
+        const dbRow = mapProductToDb(updates);
+        await supabase.from('products').update(dbRow).eq('id', id);
+      } catch (err) {
+        console.warn('[Supabase] Network error updating product:', err);
+      }
     }
   }, []);
 
   const updateProductStockStatus = useCallback(async (id: string, status: StockStatus) => {
-    setProducts((prev) =>
-      prev.map((p) => {
+    setProducts((prev) => {
+      const updated = prev.map((p) => {
         if (p.id !== id) return p;
         const inStock = status !== 'out_of_stock';
         const stock = status === 'out_of_stock' ? 0 : status === 'low_stock' && p.stock > 10 ? 5 : p.stock;
         return { ...p, stockStatus: status, inStock, stock };
-      })
-    );
+      });
+      saveToStorage('products', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
-      const target = products.find((p) => p.id === id);
-      const inStock = status !== 'out_of_stock';
-      const stock = status === 'out_of_stock' ? 0 : status === 'low_stock' && target && target.stock > 10 ? 5 : target?.stock || 0;
-      await supabase.from('products').update({
-        stock_status: status,
-        in_stock: inStock,
-        stock,
-      }).eq('id', id);
+      try {
+        const target = products.find((p) => p.id === id);
+        const inStock = status !== 'out_of_stock';
+        const stock = status === 'out_of_stock' ? 0 : status === 'low_stock' && target && target.stock > 10 ? 5 : target?.stock || 0;
+        await supabase.from('products').update({
+          stock_status: status,
+          in_stock: inStock,
+          stock,
+        }).eq('id', id);
+      } catch (err) {
+        console.warn('[Supabase] Network error updating product stock:', err);
+      }
     }
   }, [products]);
 
   const deleteProduct = useCallback(async (id: string) => {
-    setProducts((prev) => prev.filter((p) => p.id !== id));
+    // Record in deleted tracking so refresh never brings it back
+    addDeletedId('products', id);
+    removeAddedItem('products', id);
+
+    setProducts((prev) => {
+      const updated = prev.filter((p) => p.id !== id);
+      saveToStorage('products', updated);
+      return updated;
+    });
+
     if (supabase && isSupabaseConfigured()) {
-      await supabase.from('products').delete().eq('id', id);
+      try {
+        const { error } = await supabase.from('products').delete().eq('id', id);
+        if (error) console.warn('[Supabase] Delete product cloud sync:', error.message);
+      } catch (err) {
+        console.warn('[Supabase] Network error deleting product:', err);
+      }
     }
   }, []);
 
@@ -383,7 +813,11 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       rating: 5.0,
       reviewsCount: 0,
     };
-    setProducts((prev) => [duplicated, ...prev]);
+    setProducts((prev) => {
+      const updated = [duplicated, ...prev];
+      saveToStorage('products', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('products').insert(mapProductToDb(duplicated));
@@ -394,7 +828,11 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const target = products.find((p) => p.id === id);
     if (!target) return;
     const nextActive = !target.active;
-    setProducts((prev) => prev.map((p) => (p.id === id ? { ...p, active: nextActive } : p)));
+    setProducts((prev) => {
+      const updated = prev.map((p) => (p.id === id ? { ...p, active: nextActive } : p));
+      saveToStorage('products', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('products').update({ active: nextActive }).eq('id', id);
@@ -405,7 +843,11 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const target = products.find((p) => p.id === id);
     if (!target) return;
     const nextFeat = !target.featured;
-    setProducts((prev) => prev.map((p) => (p.id === id ? { ...p, featured: nextFeat } : p)));
+    setProducts((prev) => {
+      const updated = prev.map((p) => (p.id === id ? { ...p, featured: nextFeat } : p));
+      saveToStorage('products', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('products').update({ featured: nextFeat }).eq('id', id);
@@ -416,7 +858,11 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const target = products.find((p) => p.id === id);
     if (!target) return;
     const nextNew = !target.isNewArrival;
-    setProducts((prev) => prev.map((p) => (p.id === id ? { ...p, isNewArrival: nextNew } : p)));
+    setProducts((prev) => {
+      const updated = prev.map((p) => (p.id === id ? { ...p, isNewArrival: nextNew } : p));
+      saveToStorage('products', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('products').update({ is_new_arrival: nextNew }).eq('id', id);
@@ -427,82 +873,156 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const addCategory = useCallback(async (catData: Omit<Category, 'id'>): Promise<Category> => {
     const id = `cat-${catData.name.toLowerCase().replace(/\s+/g, '-')}-${Date.now().toString().slice(-4)}`;
     const newCat: Category = { ...catData, isVisible: true, id };
-    setCategories((prev) => [...prev, newCat]);
+
+    saveAddedItem('categories', newCat);
+    unmarkDeletedId('categories', id);
+
+    setCategories((prev) => {
+      const updated = [...prev.filter((c) => c.id !== id), newCat];
+      saveToStorage('categories', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
-      await supabase.from('categories').insert({
-        id,
-        name: newCat.name,
-        college_id: newCat.collegeId,
-        icon: newCat.icon || '📦',
-      });
+      try {
+        await supabase.from('categories').insert({
+          id,
+          name: newCat.name,
+          college_id: newCat.collegeId,
+          icon: newCat.icon || '📦',
+        });
+      } catch (err) {
+        console.warn('[Supabase] Add category network error:', err);
+      }
     }
 
     return newCat;
   }, []);
 
   const updateCategory = useCallback(async (id: string, updates: Partial<Category>) => {
-    setCategories((prev) => prev.map((c) => (c.id === id ? { ...c, ...updates } : c)));
+    setCategories((prev) => {
+      const updated = prev.map((c) => (c.id === id ? { ...c, ...updates } : c));
+      saveToStorage('categories', updated);
+      const target = updated.find((c) => c.id === id);
+      if (target) saveAddedItem('categories', target);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
-      await supabase.from('categories').update({
-        ...(updates.name && { name: updates.name }),
-        ...(updates.collegeId && { college_id: updates.collegeId }),
-        ...(updates.icon && { icon: updates.icon }),
-      }).eq('id', id);
+      try {
+        await supabase.from('categories').update({
+          ...(updates.name && { name: updates.name }),
+          ...(updates.collegeId && { college_id: updates.collegeId }),
+          ...(updates.icon && { icon: updates.icon }),
+        }).eq('id', id);
+      } catch (err) {
+        console.warn('[Supabase] Update category network error:', err);
+      }
     }
   }, []);
 
   const deleteCategory = useCallback(async (id: string) => {
-    setCategories((prev) => prev.filter((c) => c.id !== id));
-    setSubcategories((prev) => prev.filter((s) => s.categoryId !== id));
+    addDeletedId('categories', id);
+    removeAddedItem('categories', id);
+
+    setCategories((prev) => {
+      const updated = prev.filter((c) => c.id !== id);
+      saveToStorage('categories', updated);
+      return updated;
+    });
+    setSubcategories((prev) => {
+      const updated = prev.filter((s) => s.categoryId !== id);
+      saveToStorage('subcategories', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
-      await supabase.from('categories').delete().eq('id', id);
+      try {
+        await supabase.from('categories').delete().eq('id', id);
+      } catch (err) {
+        console.warn('[Supabase] Delete category network error:', err);
+      }
     }
   }, []);
 
   const addSubcategory = useCallback(async (subData: Omit<Subcategory, 'id'>): Promise<Subcategory> => {
     const id = `sub-${subData.name.toLowerCase().replace(/\s+/g, '-')}-${Date.now().toString().slice(-4)}`;
     const newSub: Subcategory = { ...subData, id };
-    setSubcategories((prev) => [...prev, newSub]);
+
+    saveAddedItem('subcategories', newSub);
+    unmarkDeletedId('subcategories', id);
+
+    setSubcategories((prev) => {
+      const updated = [...prev.filter((s) => s.id !== id), newSub];
+      saveToStorage('subcategories', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
-      await supabase.from('subcategories').insert({
-        id,
-        name: newSub.name,
-        category_id: newSub.categoryId,
-        college_id: newSub.collegeId,
-      });
+      try {
+        await supabase.from('subcategories').insert({
+          id,
+          name: newSub.name,
+          category_id: newSub.categoryId,
+          college_id: newSub.collegeId,
+        });
+      } catch (err) {
+        console.warn('[Supabase] Add subcategory network error:', err);
+      }
     }
 
     return newSub;
   }, []);
 
   const updateSubcategory = useCallback(async (id: string, updates: Partial<Subcategory>) => {
-    setSubcategories((prev) => prev.map((s) => (s.id === id ? { ...s, ...updates } : s)));
+    setSubcategories((prev) => {
+      const updated = prev.map((s) => (s.id === id ? { ...s, ...updates } : s));
+      saveToStorage('subcategories', updated);
+      const target = updated.find((s) => s.id === id);
+      if (target) saveAddedItem('subcategories', target);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
-      await supabase.from('subcategories').update({
-        ...(updates.name && { name: updates.name }),
-        ...(updates.categoryId && { category_id: updates.categoryId }),
-        ...(updates.collegeId && { college_id: updates.collegeId }),
-      }).eq('id', id);
+      try {
+        await supabase.from('subcategories').update({
+          ...(updates.name && { name: updates.name }),
+          ...(updates.categoryId && { category_id: updates.categoryId }),
+          ...(updates.collegeId && { college_id: updates.collegeId }),
+        }).eq('id', id);
+      } catch (err) {
+        console.warn('[Supabase] Update subcategory network error:', err);
+      }
     }
   }, []);
 
   const deleteSubcategory = useCallback(async (id: string) => {
-    setSubcategories((prev) => prev.filter((s) => s.id !== id));
+    addDeletedId('subcategories', id);
+    removeAddedItem('subcategories', id);
+
+    setSubcategories((prev) => {
+      const updated = prev.filter((s) => s.id !== id);
+      saveToStorage('subcategories', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
-      await supabase.from('subcategories').delete().eq('id', id);
+      try {
+        await supabase.from('subcategories').delete().eq('id', id);
+      } catch (err) {
+        console.warn('[Supabase] Delete subcategory network error:', err);
+      }
     }
   }, []);
 
   // ===================== KIT HANDLERS =====================
   const addKit = useCallback(async (kitData: Omit<StudentKit, 'id'>) => {
     const newKit: StudentKit = { ...kitData, id: `kit-${Date.now()}` };
-    setKits((prev) => [newKit, ...prev]);
+    setKits((prev) => {
+      const updated = [newKit, ...prev];
+      saveToStorage('kits', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('student_kits').insert({
@@ -521,7 +1041,11 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, []);
 
   const updateKit = useCallback(async (id: string, updates: Partial<StudentKit>) => {
-    setKits((prev) => prev.map((k) => (k.id === id ? { ...k, ...updates } : k)));
+    setKits((prev) => {
+      const updated = prev.map((k) => (k.id === id ? { ...k, ...updates } : k));
+      saveToStorage('kits', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('student_kits').update({
@@ -536,9 +1060,19 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, []);
 
   const deleteKit = useCallback(async (id: string) => {
-    setKits((prev) => prev.filter((k) => k.id !== id));
+    addDeletedId('kits', id);
+    removeAddedItem('kits', id);
+    setKits((prev) => {
+      const updated = prev.filter((k) => k.id !== id);
+      saveToStorage('kits', updated);
+      return updated;
+    });
     if (supabase && isSupabaseConfigured()) {
-      await supabase.from('student_kits').delete().eq('id', id);
+      try {
+        await supabase.from('student_kits').delete().eq('id', id);
+      } catch (err) {
+        console.warn('[Supabase] Delete kit cloud error:', err);
+      }
     }
   }, []);
 
@@ -546,51 +1080,86 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const addDigitalProduct = useCallback(async (itemData: Omit<DigitalProduct, 'id'>): Promise<DigitalProduct> => {
     const id = `dig-${Date.now()}`;
     const newDig: DigitalProduct = { ...itemData, id };
-    setDigitalProducts((prev) => [newDig, ...prev]);
+    saveAddedItem('digital_products', newDig);
+    unmarkDeletedId('digital_products', id);
+
+    setDigitalProducts((prev) => {
+      const updated = [newDig, ...prev];
+      saveToStorage('digital_products', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
-      await supabase.from('digital_products').insert({
-        id: newDig.id,
-        title: newDig.title,
-        college_id: newDig.collegeId,
-        file_type: newDig.fileType,
-        size: newDig.size,
-        price: newDig.price,
-        downloads_count: newDig.downloadsCount || 0,
-        active: newDig.active,
-        description: newDig.description,
-        features: newDig.features,
-      });
+      try {
+        await supabase.from('digital_products').insert({
+          id: newDig.id,
+          title: newDig.title,
+          college_id: newDig.collegeId,
+          file_type: newDig.fileType,
+          size: newDig.size,
+          price: newDig.price,
+          downloads_count: newDig.downloadsCount || 0,
+          active: newDig.active,
+          description: newDig.description,
+          features: newDig.features,
+        });
+      } catch (err) {
+        console.warn('[Supabase] Add digital product error:', err);
+      }
     }
 
     return newDig;
   }, []);
 
   const updateDigitalProduct = useCallback(async (id: string, updates: Partial<DigitalProduct>) => {
-    setDigitalProducts((prev) => prev.map((d) => (d.id === id ? { ...d, ...updates } : d)));
+    setDigitalProducts((prev) => {
+      const updated = prev.map((d) => (d.id === id ? { ...d, ...updates } : d));
+      saveToStorage('digital_products', updated);
+      const target = updated.find((d) => d.id === id);
+      if (target) saveAddedItem('digital_products', target);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
-      await supabase.from('digital_products').update({
-        ...(updates.title && { title: updates.title }),
-        ...(updates.price !== undefined && { price: updates.price }),
-        ...(updates.active !== undefined && { active: updates.active }),
-        ...(updates.description && { description: updates.description }),
-      }).eq('id', id);
+      try {
+        await supabase.from('digital_products').update({
+          ...(updates.title && { title: updates.title }),
+          ...(updates.price !== undefined && { price: updates.price }),
+          ...(updates.active !== undefined && { active: updates.active }),
+          ...(updates.description && { description: updates.description }),
+        }).eq('id', id);
+      } catch (err) {
+        console.warn('[Supabase] Update digital product error:', err);
+      }
     }
   }, []);
 
   const deleteDigitalProduct = useCallback(async (id: string) => {
-    setDigitalProducts((prev) => prev.filter((d) => d.id !== id));
+    addDeletedId('digital_products', id);
+    removeAddedItem('digital_products', id);
+    setDigitalProducts((prev) => {
+      const updated = prev.filter((d) => d.id !== id);
+      saveToStorage('digital_products', updated);
+      return updated;
+    });
     if (supabase && isSupabaseConfigured()) {
-      await supabase.from('digital_products').delete().eq('id', id);
+      try {
+        await supabase.from('digital_products').delete().eq('id', id);
+      } catch (err) {
+        console.warn('[Supabase] Delete digital product cloud error:', err);
+      }
     }
   }, []);
 
   // ===================== ORDER HANDLERS =====================
   const addOrder = useCallback(async (order: Order): Promise<boolean> => {
-    setOrders((prev) => [order, ...prev]);
+    setOrders((prev) => {
+      const updated = [order, ...prev];
+      saveToStorage('orders', updated);
+      return updated;
+    });
 
-    // Save to Supabase
+    // Save to Supabase if configured
     let savedInDb = true;
     if (supabase && isSupabaseConfigured()) {
       savedInDb = await createOrderInSupabase(order);
@@ -604,10 +1173,12 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           const threshold = liveProd.lowStockThreshold || 10;
           const newStock = Math.max(0, liveProd.stock - item.quantity);
           const computedStatus: StockStatus = newStock === 0 ? 'out_of_stock' : newStock <= threshold ? 'low_stock' : 'in_stock';
-          
-          setProducts((prev) =>
-            prev.map((p) => (p.id === item.id ? { ...p, stock: newStock, stockStatus: computedStatus, inStock: newStock > 0 } : p))
-          );
+
+          setProducts((prev) => {
+            const updated = prev.map((p) => (p.id === item.id ? { ...p, stock: newStock, stockStatus: computedStatus, inStock: newStock > 0 } : p));
+            saveToStorage('products', updated);
+            return updated;
+          });
 
           if (supabase && isSupabaseConfigured()) {
             await supabase.from('products').update({
@@ -638,8 +1209,8 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const updateOrderStatus = useCallback(async (orderId: string, status: OrderStatus) => {
     const now = new Date().toISOString().replace('T', ' ').slice(0, 16);
-    setOrders((prev) =>
-      prev.map((ord) => {
+    setOrders((prev) => {
+      const updated = prev.map((ord) => {
         if (ord.id !== orderId) return ord;
         return {
           ...ord,
@@ -649,8 +1220,10 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
             { status, date: now, description: `Order status updated to ${status}` },
           ],
         };
-      })
-    );
+      });
+      saveToStorage('orders', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
       const targetOrder = orders.find((o) => o.id === orderId);
@@ -666,9 +1239,11 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, [orders]);
 
   const updatePaymentStatus = useCallback(async (orderId: string, status: PaymentStatus) => {
-    setOrders((prev) =>
-      prev.map((ord) => (ord.id === orderId ? { ...ord, paymentStatus: status } : ord))
-    );
+    setOrders((prev) => {
+      const updated = prev.map((ord) => (ord.id === orderId ? { ...ord, paymentStatus: status } : ord));
+      saveToStorage('orders', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('orders').update({ payment_status: status }).eq('id', orderId);
@@ -682,12 +1257,14 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       author,
       createdAt: new Date().toISOString().replace('T', ' ').slice(0, 16),
     };
-    setOrders((prev) =>
-      prev.map((o) => {
+    setOrders((prev) => {
+      const updated = prev.map((o) => {
         if (o.id !== orderId) return o;
         return { ...o, internalNotes: [...(o.internalNotes || []), newNote] };
-      })
-    );
+      });
+      saveToStorage('orders', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
       const targetOrder = orders.find((o) => o.id === orderId);
@@ -697,7 +1274,11 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, [orders]);
 
   const updateOrderDetails = useCallback(async (orderId: string, updates: Partial<Order>) => {
-    setOrders((prev) => prev.map((o) => (o.id === orderId ? { ...o, ...updates } : o)));
+    setOrders((prev) => {
+      const updated = prev.map((o) => (o.id === orderId ? { ...o, ...updates } : o));
+      saveToStorage('orders', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('orders').update({
@@ -711,16 +1292,18 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const now = new Date().toISOString().replace('T', ' ').slice(0, 16);
     const targetOrder = orders.find((o) => o.id === orderId);
 
-    setOrders((prev) =>
-      prev.map((ord) => {
+    setOrders((prev) => {
+      const updated = prev.map((ord) => {
         if (ord.id !== orderId) return ord;
         return {
           ...ord,
-          status: 'Cancelled',
-          timeline: [...ord.timeline, { status: 'Cancelled', date: now, description: reason }],
+          status: 'Cancelled' as OrderStatus,
+          timeline: [...ord.timeline, { status: 'Cancelled' as OrderStatus, date: now, description: reason }],
         };
-      })
-    );
+      });
+      saveToStorage('orders', updated);
+      return updated;
+    });
 
     if (targetOrder) {
       // Restore physical product stock
@@ -729,9 +1312,11 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
           const liveProd = products.find((p) => p.id === item.id);
           if (liveProd) {
             const restoredStock = liveProd.stock + item.quantity;
-            setProducts((prev) =>
-              prev.map((p) => (p.id === item.id ? { ...p, stock: restoredStock, inStock: true, stockStatus: 'in_stock' } : p))
-            );
+            setProducts((prev) => {
+              const updated = prev.map((p) => (p.id === item.id ? { ...p, stock: restoredStock, inStock: true, stockStatus: 'in_stock' as StockStatus } : p));
+              saveToStorage('products', updated);
+              return updated;
+            });
 
             if (supabase && isSupabaseConfigured()) {
               await supabase.from('products').update({
@@ -745,7 +1330,7 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       }
 
       if (supabase && isSupabaseConfigured()) {
-        const newTimeline = [...targetOrder.timeline, { status: 'Cancelled', date: now, description: reason }];
+        const newTimeline = [...targetOrder.timeline, { status: 'Cancelled' as OrderStatus, date: now, description: reason }];
         await supabase.from('orders').update({
           status: 'Cancelled',
           timeline: newTimeline,
@@ -754,10 +1339,25 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     }
   }, [orders, products]);
 
+  const deleteOrder = useCallback(async (orderId: string) => {
+    setOrders((prev) => {
+      const updated = prev.filter((o) => o.id !== orderId);
+      saveToStorage('orders', updated);
+      return updated;
+    });
+    if (supabase && isSupabaseConfigured()) {
+      await supabase.from('orders').delete().eq('id', orderId);
+    }
+  }, []);
+
   // ===================== COUPON HANDLERS =====================
   const addCoupon = useCallback(async (couponData: Omit<Coupon, 'id'>) => {
     const newCoupon: Coupon = { ...couponData, id: `coup-${Date.now()}` };
-    setCoupons((prev) => [newCoupon, ...prev]);
+    setCoupons((prev) => {
+      const updated = [newCoupon, ...prev];
+      saveToStorage('coupons', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('coupons').insert({
@@ -776,7 +1376,11 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, []);
 
   const updateCoupon = useCallback(async (id: string, updates: Partial<Coupon>) => {
-    setCoupons((prev) => prev.map((c) => (c.id === id ? { ...c, ...updates } : c)));
+    setCoupons((prev) => {
+      const updated = prev.map((c) => (c.id === id ? { ...c, ...updates } : c));
+      saveToStorage('coupons', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('coupons').update({
@@ -788,7 +1392,11 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, []);
 
   const deleteCoupon = useCallback(async (id: string) => {
-    setCoupons((prev) => prev.filter((c) => c.id !== id));
+    setCoupons((prev) => {
+      const updated = prev.filter((c) => c.id !== id);
+      saveToStorage('coupons', updated);
+      return updated;
+    });
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('coupons').delete().eq('id', id);
     }
@@ -834,7 +1442,11 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   // ===================== BANNER & HOMEPAGE HANDLERS =====================
   const addBanner = useCallback(async (bannerData: Omit<HomepageBanner, 'id'>) => {
     const newBanner: HomepageBanner = { ...bannerData, id: `ban-${Date.now()}` };
-    setBanners((prev) => [...prev, newBanner]);
+    setBanners((prev) => {
+      const updated = [...prev, newBanner];
+      saveToStorage('banners', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('homepage_banners').insert({
@@ -854,7 +1466,11 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, []);
 
   const updateBanner = useCallback(async (id: string, updates: Partial<HomepageBanner>) => {
-    setBanners((prev) => prev.map((b) => (b.id === id ? { ...b, ...updates } : b)));
+    setBanners((prev) => {
+      const updated = prev.map((b) => (b.id === id ? { ...b, ...updates } : b));
+      saveToStorage('banners', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('homepage_banners').update({
@@ -866,7 +1482,11 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, []);
 
   const deleteBanner = useCallback(async (id: string) => {
-    setBanners((prev) => prev.filter((b) => b.id !== id));
+    setBanners((prev) => {
+      const updated = prev.filter((b) => b.id !== id);
+      saveToStorage('banners', updated);
+      return updated;
+    });
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('homepage_banners').delete().eq('id', id);
     }
@@ -875,6 +1495,7 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const updateHomepageSettings = useCallback(async (updates: Partial<HomepageSettings>) => {
     setHomepageSettings((prev) => {
       const updated = { ...prev, ...updates };
+      saveToStorage('homepage_settings', updated);
       if (supabase && isSupabaseConfigured()) {
         supabase.from('homepage_settings').upsert({
           id: 'default',
@@ -894,14 +1515,22 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   // ===================== REVIEW HANDLERS =====================
   const updateReviewStatus = useCallback(async (id: string, status: 'approved' | 'pending' | 'rejected') => {
-    setReviews((prev) => prev.map((r) => (r.id === id ? { ...r, status } : r)));
+    setReviews((prev) => {
+      const updated = prev.map((r) => (r.id === id ? { ...r, status } : r));
+      saveToStorage('reviews', updated);
+      return updated;
+    });
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('reviews').update({ status }).eq('id', id);
     }
   }, []);
 
   const deleteReview = useCallback(async (id: string) => {
-    setReviews((prev) => prev.filter((r) => r.id !== id));
+    setReviews((prev) => {
+      const updated = prev.filter((r) => r.id !== id);
+      saveToStorage('reviews', updated);
+      return updated;
+    });
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('reviews').delete().eq('id', id);
     }
@@ -911,7 +1540,11 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     const target = reviews.find((r) => r.id === id);
     if (!target) return;
     const nextFeat = !target.isFeatured;
-    setReviews((prev) => prev.map((r) => (r.id === id ? { ...r, isFeatured: nextFeat } : r)));
+    setReviews((prev) => {
+      const updated = prev.map((r) => (r.id === id ? { ...r, isFeatured: nextFeat } : r));
+      saveToStorage('reviews', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('reviews').update({ is_featured: nextFeat }).eq('id', id);
@@ -925,7 +1558,11 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       date: new Date().toISOString().split('T')[0],
       status: 'pending',
     };
-    setReviews((prev) => [newRev, ...prev]);
+    setReviews((prev) => {
+      const updated = [newRev, ...prev];
+      saveToStorage('reviews', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('reviews').insert({
@@ -944,14 +1581,22 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   // ===================== PRINTING & CUSTOM ORDER HANDLERS =====================
   const updatePrintingStatus = useCallback(async (id: string, status: PrintingRequest['status']) => {
-    setPrintingRequests((prev) => prev.map((p) => (p.id === id ? { ...p, status } : p)));
+    setPrintingRequests((prev) => {
+      const updated = prev.map((p) => (p.id === id ? { ...p, status } : p));
+      saveToStorage('printing', updated);
+      return updated;
+    });
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('printing_requests').update({ status }).eq('id', id);
     }
   }, []);
 
   const updateCustomOrderStatus = useCallback(async (id: string, status: CustomOrder['status']) => {
-    setCustomOrders((prev) => prev.map((c) => (c.id === id ? { ...c, status } : c)));
+    setCustomOrders((prev) => {
+      const updated = prev.map((c) => (c.id === id ? { ...c, status } : c));
+      saveToStorage('custom_orders', updated);
+      return updated;
+    });
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('custom_orders').update({ status }).eq('id', id);
     }
@@ -964,7 +1609,11 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       submittedAt: new Date().toISOString().replace('T', ' ').slice(0, 16),
       timeline: [{ status: reqData.status || 'Pending', date: new Date().toISOString().split('T')[0], description: 'Request submitted' }],
     };
-    setPrintingRequests((prev) => [newReq, ...prev]);
+    setPrintingRequests((prev) => {
+      const updated = [newReq, ...prev];
+      saveToStorage('printing', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('printing_requests').insert({
@@ -997,7 +1646,11 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
       date: new Date().toISOString().replace('T', ' ').slice(0, 16),
       timeline: [{ status: ordData.status || 'Pending', date: new Date().toISOString().split('T')[0], description: 'Custom order submitted' }],
     };
-    setCustomOrders((prev) => [newCustom, ...prev]);
+    setCustomOrders((prev) => {
+      const updated = [newCustom, ...prev];
+      saveToStorage('custom_orders', updated);
+      return updated;
+    });
 
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('custom_orders').insert({
@@ -1023,28 +1676,40 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const addPrintingInternalNote = useCallback(async (id: string, text: string, author: string = 'Admin') => {
     const note = { id: `note-${Date.now()}`, text, author, createdAt: new Date().toISOString().replace('T', ' ').slice(0, 16) };
-    setPrintingRequests((prev) =>
-      prev.map((p) => (p.id === id ? { ...p, internalNotes: [...(p.internalNotes || []), note] } : p))
-    );
+    setPrintingRequests((prev) => {
+      const updated = prev.map((p) => (p.id === id ? { ...p, internalNotes: [...(p.internalNotes || []), note] } : p));
+      saveToStorage('printing', updated);
+      return updated;
+    });
   }, []);
 
   const addCustomOrderInternalNote = useCallback(async (id: string, text: string, author: string = 'Admin') => {
     const note = { id: `note-${Date.now()}`, text, author, createdAt: new Date().toISOString().replace('T', ' ').slice(0, 16) };
-    setCustomOrders((prev) =>
-      prev.map((c) => (c.id === id ? { ...c, internalNotes: [...(c.internalNotes || []), note] } : c))
-    );
+    setCustomOrders((prev) => {
+      const updated = prev.map((c) => (c.id === id ? { ...c, internalNotes: [...(c.internalNotes || []), note] } : c));
+      saveToStorage('custom_orders', updated);
+      return updated;
+    });
   }, []);
 
   // ===================== NOTIFICATIONS =====================
   const markNotificationRead = useCallback(async (id: string) => {
-    setNotifications((prev) => prev.map((n) => (n.id === id ? { ...n, read: true } : n)));
+    setNotifications((prev) => {
+      const updated = prev.map((n) => (n.id === id ? { ...n, read: true } : n));
+      saveToStorage('notifications', updated);
+      return updated;
+    });
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('notifications').update({ read: true }).eq('id', id);
     }
   }, []);
 
   const markAllNotificationsRead = useCallback(async () => {
-    setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
+    setNotifications((prev) => {
+      const updated = prev.map((n) => ({ ...n, read: true }));
+      saveToStorage('notifications', updated);
+      return updated;
+    });
     if (supabase && isSupabaseConfigured()) {
       await supabase.from('notifications').update({ read: true }).neq('id', '');
     }
@@ -1054,6 +1719,7 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const updateStoreSettings = useCallback(async (updates: Partial<StoreSettings>) => {
     setSettings((prev) => {
       const updated = { ...prev, ...updates };
+      saveToStorage('settings', updated);
       if (supabase && isSupabaseConfigured()) {
         supabase.from('store_settings').upsert({
           id: 'default',
@@ -1092,6 +1758,12 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
 
   const factoryResetAllData = useCallback(async () => {
     localStorage.clear();
+    setProducts(productsData);
+    setCategories(categoriesData);
+    setSubcategories(subcategoriesData);
+    setOrders(initialOrders);
+    setCoupons(initialCoupons);
+    setSettings(initialStoreSettings);
     await loadData();
   }, [loadData]);
 
@@ -1193,6 +1865,13 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         isSupabaseLive,
         isLoadingData,
 
+        // Supabase Cloud Sync
+        supabaseConfig,
+        saveSupabaseCredentials,
+        disconnectSupabaseCredentials,
+        syncLocalToCloud,
+        testCloudConnection,
+
         addProduct,
         updateProduct,
         deleteProduct,
@@ -1223,6 +1902,7 @@ export const StoreDataProvider: React.FC<{ children: React.ReactNode }> = ({ chi
         addOrderInternalNote,
         updateOrderDetails,
         cancelOrder,
+        deleteOrder,
 
         addCoupon,
         updateCoupon,

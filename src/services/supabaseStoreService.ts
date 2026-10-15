@@ -221,9 +221,14 @@ export const fetchAllStoreData = async () => {
       supabase.from('inventory_logs').select('*').order('created_at', { ascending: false }),
     ]);
 
+    // Validate errors from Supabase queries to avoid overwriting state with empty arrays
+    if (productsRes.error) console.warn('[Supabase] Products query error:', productsRes.error.message);
+    if (categoriesRes.error) console.warn('[Supabase] Categories query error:', categoriesRes.error.message);
+    if (ordersRes.error) console.warn('[Supabase] Orders query error:', ordersRes.error.message);
+
     // Map Order Items to their respective parent Orders
     const itemsByOrder: Record<string, CartItem[]> = {};
-    if (orderItemsRes.data) {
+    if (!orderItemsRes.error && Array.isArray(orderItemsRes.data)) {
       orderItemsRes.data.forEach((row) => {
         if (!itemsByOrder[row.order_id]) {
           itemsByOrder[row.order_id] = [];
@@ -232,25 +237,25 @@ export const fetchAllStoreData = async () => {
       });
     }
 
-    const mappedOrders = (ordersRes.data || []).map((row) =>
-      mapOrderFromDb(row, itemsByOrder[row.id] || [])
-    );
+    const mappedOrders = !ordersRes.error && Array.isArray(ordersRes.data)
+      ? ordersRes.data.map((row) => mapOrderFromDb(row, itemsByOrder[row.id] || []))
+      : undefined;
 
     return {
-      products: (productsRes.data || []).map(mapProductFromDb),
-      categories: (categoriesRes.data || []).map((row) => ({
+      products: !productsRes.error && Array.isArray(productsRes.data) ? productsRes.data.map(mapProductFromDb) : undefined,
+      categories: !categoriesRes.error && Array.isArray(categoriesRes.data) ? categoriesRes.data.map((row) => ({
         id: row.id,
         name: row.name,
         collegeId: row.college_id as CollegeId,
         icon: row.icon || '📦',
-      })),
-      subcategories: (subcategoriesRes.data || []).map((row) => ({
+      })) : undefined,
+      subcategories: !subcategoriesRes.error && Array.isArray(subcategoriesRes.data) ? subcategoriesRes.data.map((row) => ({
         id: row.id,
         name: row.name,
         categoryId: row.category_id,
         collegeId: row.college_id as CollegeId,
-      })),
-      colleges: (collegesRes.data || []).map((row) => ({
+      })) : undefined,
+      colleges: !collegesRes.error && Array.isArray(collegesRes.data) ? collegesRes.data.map((row) => ({
         id: row.id as CollegeId,
         name: row.name,
         nameAr: row.name_ar || row.name,
@@ -259,7 +264,7 @@ export const fetchAllStoreData = async () => {
         accentColor: 'bg-blue-600',
         categories: [],
         descriptionAr: row.description_ar,
-      })),
+      })) : undefined,
       kits: (kitsRes.data || []).map((row) => ({
         id: row.id,
         title: row.title,
@@ -287,7 +292,7 @@ export const fetchAllStoreData = async () => {
         features: row.features || [],
       })),
       orders: mappedOrders,
-      reviews: (reviewsRes.data || []).map((row) => ({
+      reviews: !reviewsRes.error && Array.isArray(reviewsRes.data) ? reviewsRes.data.map((row) => ({
         id: row.id,
         productId: row.product_id,
         productTitle: row.product_title,
@@ -298,8 +303,8 @@ export const fetchAllStoreData = async () => {
         date: row.date,
         status: row.status as any,
         isFeatured: Boolean(row.is_featured),
-      })),
-      coupons: (couponsRes.data || []).map((row) => ({
+      })) : undefined,
+      coupons: !couponsRes.error && Array.isArray(couponsRes.data) ? couponsRes.data.map((row) => ({
         id: row.id,
         code: row.code,
         discountType: row.discount_type as any,
@@ -310,8 +315,8 @@ export const fetchAllStoreData = async () => {
         timesUsed: Number(row.times_used || 0),
         expiryDate: row.expiry_date || '2026-12-31',
         active: Boolean(row.active),
-      })),
-      banners: (bannersRes.data || []).map((row) => ({
+      })) : undefined,
+      banners: !bannersRes.error && Array.isArray(bannersRes.data) ? bannersRes.data.map((row) => ({
         id: row.id,
         title: row.title,
         subtitle: row.subtitle || '',
@@ -323,8 +328,8 @@ export const fetchAllStoreData = async () => {
         collegeId: (row.college_id as CollegeId | 'all') || 'all',
         active: Boolean(row.active),
         order: Number(row.banner_order || 1),
-      })),
-      homepageSettings: homepageSettingsRes.data
+      })) : undefined,
+      homepageSettings: !homepageSettingsRes.error && homepageSettingsRes.data
         ? {
             heroTitle: homepageSettingsRes.data.hero_title,
             heroSubtitle: homepageSettingsRes.data.hero_subtitle,
@@ -508,12 +513,42 @@ export const trackOrderInSupabase = async (orderId: string, phone: string): Prom
 };
 
 /**
- * Seed initial mock data to Supabase if tables are empty
+ * Test whether the Supabase database connection and tables are ready
+ */
+export const testSupabaseConnection = async (): Promise<{ success: boolean; message: string }> => {
+  if (!isSupabaseConfigured()) {
+    return { success: false, message: 'Supabase credentials are not configured yet.' };
+  }
+  try {
+    const { error } = await supabase.from('products').select('id', { head: true, count: 'exact' });
+    if (error) {
+      return { success: false, message: error.message || 'Failed to query Supabase products table.' };
+    }
+    return { success: true, message: 'Connected successfully to Supabase cloud database.' };
+  } catch (err: any) {
+    return { success: false, message: err?.message || 'Network error connecting to Supabase.' };
+  }
+};
+
+/**
+ * Seed initial mock data to Supabase ONLY ONCE if database is fresh
  */
 export const seedInitialDataToSupabase = async (seedData: any) => {
   if (!supabase || !isSupabaseConfigured()) return;
 
+  // Never re-seed if already seeded before
+  if (typeof window !== 'undefined' && localStorage.getItem('sh_supabase_seeded') === 'true') {
+    return;
+  }
+
   try {
+    // Check if store settings already exist (means db is initialized)
+    const { count: settingsCount } = await supabase.from('store_settings').select('*', { count: 'exact', head: true });
+    if (settingsCount && settingsCount > 0) {
+      if (typeof window !== 'undefined') localStorage.setItem('sh_supabase_seeded', 'true');
+      return;
+    }
+
     // Check if products exist
     const { count } = await supabase.from('products').select('*', { count: 'exact', head: true });
     if (count === 0 && seedData.products && seedData.products.length > 0) {
@@ -535,12 +570,11 @@ export const seedInitialDataToSupabase = async (seedData: any) => {
       await supabase.from('categories').insert(dbCategories);
     }
 
-    // Check store settings
-    const { count: settingsCount } = await supabase.from('store_settings').select('*', { count: 'exact', head: true });
-    if (settingsCount === 0 && seedData.settings) {
+    // Seed store settings
+    if (seedData.settings) {
       console.log('Seeding store settings to Supabase...');
       const s = seedData.settings;
-      await supabase.from('store_settings').insert({
+      await supabase.from('store_settings').upsert({
         id: 'default',
         store_name: s.storeName,
         tagline: s.tagline,
@@ -571,7 +605,119 @@ export const seedInitialDataToSupabase = async (seedData: any) => {
         custom_design_templates: s.customDesignTemplates,
       });
     }
+
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('sh_supabase_seeded', 'true');
+    }
   } catch (err) {
     console.error('Error during Supabase initial seeding:', err);
+  }
+};
+
+/**
+ * Manually upload & sync all active local data to Supabase
+ */
+export const syncAllLocalDataToSupabase = async (data: {
+  products: Product[];
+  categories: Category[];
+  subcategories: Subcategory[];
+  settings: StoreSettings;
+  coupons?: Coupon[];
+  banners?: HomepageBanner[];
+  orders?: Order[];
+}): Promise<{ success: boolean; message: string }> => {
+  if (!supabase || !isSupabaseConfigured()) {
+    return { success: false, message: 'Supabase is not configured yet.' };
+  }
+
+  try {
+    // 1. Sync Categories
+    if (data.categories && data.categories.length > 0) {
+      const dbCats = data.categories.map((c) => ({
+        id: c.id,
+        name: c.name,
+        college_id: c.collegeId,
+        icon: c.icon,
+      }));
+      await supabase.from('categories').upsert(dbCats);
+    }
+
+    // 2. Sync Subcategories
+    if (data.subcategories && data.subcategories.length > 0) {
+      const dbSubs = data.subcategories.map((s) => ({
+        id: s.id,
+        name: s.name,
+        category_id: s.categoryId,
+        college_id: s.collegeId,
+      }));
+      await supabase.from('subcategories').upsert(dbSubs);
+    }
+
+    // 3. Sync Products
+    if (data.products && data.products.length > 0) {
+      const dbProds = data.products.map(mapProductToDb);
+      await supabase.from('products').upsert(dbProds);
+    }
+
+    // 4. Sync Settings
+    if (data.settings) {
+      const s = data.settings;
+      await supabase.from('store_settings').upsert({
+        id: 'default',
+        store_name: s.storeName,
+        tagline: s.tagline,
+        logo_url: s.logoUrl,
+        favicon_url: s.faviconUrl,
+        store_description: s.storeDescription,
+        physical_address: s.physicalAddress,
+        support_phone: s.supportPhone,
+        support_email: s.supportEmail,
+        free_shipping_threshold: s.freeShippingThreshold,
+        standard_shipping_fee: s.standardShippingFee,
+        currency: s.currency,
+        currency_symbol: s.currencySymbol,
+        tax_rate: s.taxRate,
+        campuses: s.campuses,
+        admin_pin: s.adminPin || 'admin2026',
+        store_open: s.storeOpen ?? true,
+        store_closed_message: s.storeClosedMessage,
+        site_title: s.siteTitle,
+        meta_description: s.metaDescription,
+        social_sharing_image: s.socialSharingImage,
+        navigation_links: s.navigationLinks,
+        pickup_locations: s.pickupLocations,
+        payment_methods: s.paymentMethods,
+        delivery_settings: s.deliverySettings,
+        website_content: s.websiteContent,
+        social_links: s.socialLinks,
+        custom_design_templates: s.customDesignTemplates,
+      });
+    }
+
+    // 5. Sync Coupons
+    if (data.coupons && data.coupons.length > 0) {
+      const dbCoupons = data.coupons.map((c) => ({
+        id: c.id,
+        code: c.code,
+        discount_type: c.discountType,
+        discount_value: c.discountValue,
+        min_order_amount: c.minOrderAmount,
+        college_id: c.collegeId,
+        max_uses: c.maxUses,
+        times_used: c.timesUsed,
+        expiry_date: c.expiryDate,
+        active: c.active,
+      }));
+      await supabase.from('coupons').upsert(dbCoupons);
+    }
+
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('sh_supabase_seeded', 'true');
+    }
+
+    return { success: true, message: 'All local products, categories, coupons, and settings uploaded to Supabase!' };
+  } catch (err: any) {
+    console.error('Error syncing local data to Supabase:', err);
+    return { success: false, message: err?.message || 'Failed to sync data to Supabase.' };
   }
 };
